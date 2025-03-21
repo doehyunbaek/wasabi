@@ -12,8 +12,8 @@ class Trace {
   constructor() {
     this.trace = [];
   }
-  push(event) {
-    console.log(JSON.stringify(event));
+  push(event, analysis_i) {
+    console.log(`r3(${analysis_i}) ${JSON.stringify(event)}`);
     this.trace.push(event);
   }
   toString() {
@@ -25,13 +25,14 @@ class Analysis {
   Wasabi;
   trace = new Trace();
   callStack = [{ idx: -1 }];
-  constructor(Wasabi) {
+  constructor(Wasabi, analysis_i) {
     this.Wasabi = Wasabi;
+    this.analysis_i = analysis_i
     Wasabi.analysis = {
       begin_function: (location, args) => {
         if (this.callStack[this.callStack.length - 1] !== "int") {
           const exportName = this.Wasabi.module.info.functions[location.func].export[0];
-          this.trace.push(`EC;${location.func};${exportName};${args.join(",")}`);
+          this.trace.push(`EC;${location.func};${exportName};${args.join(",")}`, this.analysis_i);
           this.checkMemGrow();
           // this.checkTableGrow();
         }
@@ -40,7 +41,7 @@ class Analysis {
       return_: (location, values) => {
         this.callStack.pop();
         if (this.callStack.length === 1) {
-          this.trace.push(`ER`);
+          this.trace.push(`ER`, this.analysis_i);
         }
       },
       call_pre: (location, targetFunc, args, indirectTableIdx) => {
@@ -53,7 +54,7 @@ class Analysis {
         let funcImport = Wasabi.module.info.functions[targetFunc].import;
         if (funcImport !== null) {
           this.callStack.push({ idx: targetFunc });
-          this.trace.push(`IC;${targetFunc}`);
+          this.trace.push(`IC;${targetFunc}`, this.analysis_i);
         }
       },
       call_post: (location, values) => {
@@ -62,7 +63,7 @@ class Analysis {
           return;
         }
         this.callStack.pop();
-        this.trace.push(`IR;${func.idx};${values.join(",")}`);
+        this.trace.push(`IR;${func.idx};${values.join(",")}`, this.analysis_i);
         this.checkMemGrow();
         // this.checkTableGrow();
       },
@@ -85,7 +86,7 @@ class Analysis {
           for (let i = 0; i < byteLength; i++) {
             const byte = this.memories[memIdx].get(addr + i);
             this.shadowMemories[memIdx].set(addr + i, byte)
-            this.trace.push(`L;${0};${addr + i};${[byte]}`);
+            this.trace.push(`L;${0};${addr + i};${[byte]}`, this.analysis_i);
           }
         }
       },
@@ -99,7 +100,7 @@ class Analysis {
           this.shadowGlobals[globalIndex].value = value;
         } else if (op === "global.get") {
           if ((this.shadowGlobals[globalIndex].value !== value) && !(Number.isNaN(this.shadowGlobals[globalIndex].value) && Number.isNaN(value))) {
-            this.trace.push(`G;${globalIndex};${value}`);
+            this.trace.push(`G;${globalIndex};${value}`, this.analysis_i);
             this.shadowGlobals[globalIndex].value = value;
           }
         }
@@ -115,7 +116,7 @@ class Analysis {
         //     let name = this.getName(this.Wasabi.module.info.tables[tableidx])
         //     let funcidx = this.resolveFuncIdx(table, idx)
         //     this.stats.relevantTableGets++;
-        //     this.trace.push(`T;${tableidx};${name};${idx};${funcidx}`)
+        //     this.trace.push(`T;${tableidx};${name};${idx};${funcidx}, this.analysis_i`)
         //     shadowTable.set(0, table.get(idx))
         //   }
         throw new Error("table_get unstable");
@@ -142,8 +143,7 @@ class Analysis {
         const shadowMemPageSize = this.shadowMemories[idx].buffer.byteLength / MEM_PAGE_SIZE;
         let amount = memPageSize - shadowMemPageSize;
         this.shadowMemories[idx].grow(amount);
-        this.trace.push(`MG;${idx};${amount}`
-        );
+        this.trace.push(`MG;${idx};${amount},`, this.analysis_i);
       }
     });
   }
@@ -156,7 +156,7 @@ class Analysis {
   //         this.shadowTables[idx].length;
   //       tableGrow[idx] = amount;
   //       this.growShadowTable(idx, amount);
-  //       this.trace.push(
+  //       this.trace.pus, this.analysis_ih(
   //         `TG;${idx};${this.getName(
   //           this.Wasabi.module.info.tables[0]
   //         )};${amount}`
@@ -263,7 +263,7 @@ class Analysis {
       this.globals.push(originalGlobal);
       this.shadowGlobals.push(shadowGlobal);
       if (globalInfo.import !== null) {
-        this.trace.push(`IG;${idx};${originalGlobal.value}`)
+        this.trace.push(`IG;${idx};${originalGlobal.value}`, this.analysis_i)
       }
     });
   }
@@ -318,7 +318,7 @@ function setup() {
     wasabis.push(eval(js + "\nWasabi"));
     buffer = new Uint8Array(instrumented);
     importObject = importObjectWithHooks(importObject, this_i);
-    const analysis = new Analysis(wasabis[this_i])
+    const analysis = new Analysis(wasabis[this_i], this_i)
     self.analysis.push(analysis);
     const result = original_instantiate(buffer, importObject);
     result.then(({ module, instance }) => {
@@ -367,7 +367,7 @@ function setup() {
     wasabis.push(eval(js + '\nWasabi'))
     buffer = new Uint8Array(instrumented)
     importObject = importObjectWithHooks(importObject, this_i)
-    const analysis = new Analysis(wasabis[this_i])
+    const analysis = new Analysis(wasabis[this_i], this_i)
     self.analysis.push(analysis);
     let result
     module = new WebAssembly.Module(buffer)
@@ -385,7 +385,11 @@ function setup() {
     let url = window.URL.createObjectURL(blob);
     let a = document.createElement("a");
     a.href = url;
-    a.download = `filename-${i}.txt`;
+    const hashBuffer = crypto.subtle.digest('SHA-256', buffer).then(hash => {
+      const hashArray = Array.from(new Uint8Array(hash));
+      const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      a.download = `wasm-${hashHex}.txt`;
+    });
     a.style.display = "none";
     document.body.appendChild(a);
     a.click();
