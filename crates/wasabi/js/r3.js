@@ -143,7 +143,7 @@ class Analysis {
         const shadowMemPageSize = this.shadowMemories[idx].buffer.byteLength / MEM_PAGE_SIZE;
         let amount = memPageSize - shadowMemPageSize;
         this.shadowMemories[idx].grow(amount);
-        this.trace.push(`MG;${idx};${amount},`, this.analysis_i);
+        this.trace.push(`MG;${idx};${amount}`, this.analysis_i);
       }
     });
   }
