@@ -20,6 +20,11 @@ pub enum WasmExtension {
     TypeImports,
     MultiMemory,
     ComponentModel,
+    GarbageCollection,
+
+    MemoryControl,
+    SharedEverythingThreads,
+    TypedFunctionReferences,
 }
 
 impl WasmExtension {
@@ -42,6 +47,11 @@ impl WasmExtension {
             TypeImports => "type imports",
             MultiMemory => "multiple memories",
             ComponentModel => "component model",
+            GarbageCollection => "garbage collection",
+
+            MemoryControl => "memory control",
+            SharedEverythingThreads => "shared-everything threads",
+            TypedFunctionReferences => "typed function references",
         }
     }
 
@@ -65,6 +75,11 @@ impl WasmExtension {
             TypeImports => r"https://github.com/WebAssembly/proposal-type-imports",
             MultiMemory => r"https://github.com/WebAssembly/multi-memory",
             ComponentModel => r"https://github.com/WebAssembly/component-model",
+            GarbageCollection => r"https://github.com/WebAssembly/gc",
+
+            MemoryControl => r"https://github.com/WebAssembly/memory-control",
+            SharedEverythingThreads => r"https://github.com/WebAssembly/shared-everything-threads",
+            TypedFunctionReferences => r"https://github.com/WebAssembly/function-references",
         }
     }
 }
