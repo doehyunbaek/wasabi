@@ -1,6 +1,7 @@
 //! Code for encoding our AST back to the WebAssembly binary format.
 //! Uses `wasm-encoder` for the actual low-level work.
 
+use std::borrow::Cow;
 use std::sync::RwLock;
 
 use nohash_hasher::IntMap;
@@ -357,8 +358,8 @@ fn encode_tables(
     for (hl_element_idx, element) in module.elements() {
         state.insert_element_idx(hl_element_idx);
         let element_type = match element.typ {
-            RefType::FuncRef => we::ValType::FuncRef,
-            RefType::ExternRef => we::ValType::ExternRef,
+            RefType::FuncRef => we::RefType::FUNCREF,
+            RefType::ExternRef => we::RefType::EXTERNREF,
         };
         let expr = element
             .init
@@ -368,19 +369,18 @@ fn encode_tables(
             })
             .map(|expr| expr.map_err(|e| e.into()))
             .collect::<Result<Vec<ConstExpr>, EncodeError>>()?;
-        let elements = we::Elements::Expressions(&expr);
+        let elements = we::Elements::Expressions(element_type, &expr);
         match &element.mode {
-            ElementMode::Passive => element_section.passive(element_type, elements),
+            ElementMode::Passive => element_section.passive(elements),
             ElementMode::Active { table, offset } => {
                 let ll_offset = encode_single_instruction_with_end(&offset, state)?;
-                element_section.active(
-                    Some(state.map_table_idx(*table)?.to_u32()),
-                    &ll_offset,
-                    element_type,
-                    elements,
-                )
+                let table_index = match table {
+                    Some(table) => Some(state.map_table_idx(*table)?.to_u32()),
+                    None => None,
+                };
+                element_section.active(table_index, &ll_offset, elements)
             }
-            ElementMode::Declarative => element_section.declared(element_type, elements),
+            ElementMode::Declarative => element_section.declared(elements),
         };
     }
 
@@ -482,8 +482,8 @@ fn encode_and_insert_custom(
         // Right now, this would drop the custom section.
         if state.last_encoded_section == custom.previous_section {
             encoder.section(&wasm_encoder::CustomSection {
-                name: &custom.name,
-                data: &custom.content[..],
+                name: Cow::Borrowed(&custom.name),
+                data: Cow::Borrowed(&custom.content[..]),
             });
             state.custom_sections_encoded += 1;
             state.last_encoded_section = Some(SectionId::Custom(custom.name.clone()));
@@ -723,8 +723,8 @@ fn encode_instruction(
         Instr::Binary(BinaryOp::F64Max) => we::Instruction::F64Max,
         Instr::Binary(BinaryOp::F64Copysign) => we::Instruction::F64Copysign,
         Instr::RefNull(ty) => we::Instruction::RefNull(match ty {
-            RefType::FuncRef => we::ValType::FuncRef,
-            RefType::ExternRef => we::ValType::ExternRef,
+            RefType::FuncRef => we::HeapType::Func,
+            RefType::ExternRef => we::HeapType::Extern,
         }),
         Instr::RefIsNull => we::Instruction::RefIsNull,
         Instr::RefFunc(function_idx) => {
@@ -845,29 +845,32 @@ impl From<GlobalType> for we::GlobalType {
                 Mutability::Const => false,
                 Mutability::Mut => true,
             },
+            shared: false,
         }
     }
 }
 
 fn get_tabletype_from_table(t: &Table) -> we::TableType {
     let element_type = match t.ref_type {
-        RefType::FuncRef => we::ValType::FuncRef,
-        RefType::ExternRef => we::ValType::ExternRef,
+        RefType::FuncRef => we::RefType::FUNCREF,
+        RefType::ExternRef => we::RefType::EXTERNREF,
     };
     we::TableType {
         element_type,
         minimum: t.limits.initial_size,
         maximum: t.limits.max_size,
+        table64: false,
     }
 }
 
 impl From<Limits> for we::MemoryType {
     fn from(limits: Limits) -> Self {
         Self {
-            minimum: limits.initial_size.into(),
-            maximum: limits.max_size.map(|u32| u32.into()),
+            minimum: limits.initial_size,
+            maximum: limits.max_size,
             memory64: false,
             shared: false,
+            page_size_log2: None,
         }
     }
 }
@@ -880,8 +883,8 @@ impl From<ValType> for we::ValType {
             I64 => we::ValType::I64,
             F32 => we::ValType::F32,
             F64 => we::ValType::F64,
-            Ref(RefType::FuncRef) => we::ValType::FuncRef,
-            Ref(RefType::ExternRef) => we::ValType::ExternRef,
+            Ref(RefType::FuncRef) => we::ValType::Ref(we::RefType::FUNCREF),
+            Ref(RefType::ExternRef) => we::ValType::Ref(we::RefType::EXTERNREF),
         }
     }
 }

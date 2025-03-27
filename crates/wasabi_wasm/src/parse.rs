@@ -61,9 +61,17 @@ pub fn parse_module(bytes: &[u8]) -> Result<(Module, Offsets, ParseWarnings), Pa
                 types.new_type_section(reader.count(), type_offset)?;
 
                 for elem in reader.into_iter_with_offsets() {
-                    let (offset, wp::Type::Func(type_)) = elem?;
-                    let type_ = parse_func_ty(type_, offset)?;
-                    types.add(type_);
+                    let (offset, rec_group) = elem?;
+                    for type_ in rec_group.types() {
+                        match &type_.composite_type {
+                            wp::CompositeType::Func(func_type) => {
+                                let type_ = parse_func_ty(func_type.clone(), offset)?;
+                                types.add(type_);
+                            }
+                            wp::CompositeType::Array(_array_type) => todo!(),
+                            wp::CompositeType::Struct(_struct_type) => todo!(),
+                        }
+                    }
                 }
             }
             wp::Payload::ImportSection(reader) => {
@@ -143,8 +151,8 @@ pub fn parse_module(bytes: &[u8]) -> Result<(Module, Offsets, ParseWarnings), Pa
                 module.tables.reserve(u32_to_usize(table_count));
 
                 for elem in reader.into_iter_with_offsets() {
-                    let (offset, table_ty) = elem?;
-                    let (limits, ref_type) = parse_table_ty(table_ty, offset)?;
+                    let (offset, table) = elem?;
+                    let (limits, ref_type) = parse_table_ty(table.ty, offset)?;
                     // Fill in the elements of the table later with the element section.
                     module.tables.push(Table::new(limits, ref_type));
                 }
@@ -256,8 +264,8 @@ pub fn parse_module(bytes: &[u8]) -> Result<(Module, Offsets, ParseWarnings), Pa
 
                 for elem in reader.into_iter_with_offsets() {
                     let (element_offset, element) = elem?;
-                    let refty = parse_elem_ty(element.ty, element_offset)?;
 
+                    let mut ref_ty = RefType::FuncRef;
                     let items: Vec<Expr> = match element.items {
                         wp::ElementItems::Functions(items_reader) => {
                             let mut offset_instrs = Vec::new();
@@ -269,7 +277,8 @@ pub fn parse_module(bytes: &[u8]) -> Result<(Module, Offsets, ParseWarnings), Pa
                             });
                             offset_instrs.chunks(2).map(|x| x.to_vec()).collect()
                         }
-                        wp::ElementItems::Expressions(items_reader) => {
+                        wp::ElementItems::Expressions(ref_ty_, items_reader) => {
+                            ref_ty = parse_ref_ty(ref_ty_, element_offset)?;
                             let mut offset_instrs = Vec::new();
                             items_reader.into_iter().for_each(|const_expr| {
                                 if let Ok(const_expr) = const_expr {
@@ -305,21 +314,21 @@ pub fn parse_module(bytes: &[u8]) -> Result<(Module, Offsets, ParseWarnings), Pa
                             }
 
                             module.elements.push(Element {
-                                typ: refty,
+                                typ: ref_ty,
                                 init: items,
                                 mode: ElementMode::Active {
-                                    table: table_index.into(),
+                                    table: table_index.map(|i| i.into()),
                                     offset: offset_instrs,
                                 },
                             })
                         }
                         wp::ElementKind::Passive => module.elements.push(Element {
-                            typ: refty,
+                            typ: ref_ty,
                             init: items,
                             mode: ElementMode::Passive,
                         }),
                         wp::ElementKind::Declared => module.elements.push(Element {
-                            typ: refty,
+                            typ: ref_ty,
                             init: items,
                             mode: ElementMode::Declarative,
                         }),
@@ -444,9 +453,15 @@ pub fn parse_module(bytes: &[u8]) -> Result<(Module, Offsets, ParseWarnings), Pa
                 };
                 module.custom_sections.push(raw_custom_section);
             }
-            wp::Payload::ModuleSection { parser: _, range }
-            | wp::Payload::ComponentSection { parser: _, range } => Err(ParseIssue::unsupported(
-                range.start,
+            wp::Payload::ModuleSection {
+                parser: _,
+                unchecked_range,
+            }
+            | wp::Payload::ComponentSection {
+                parser: _,
+                unchecked_range,
+            } => Err(ParseIssue::unsupported(
+                unchecked_range.start,
                 WasmExtension::ComponentModel,
             ))?,
             wp::Payload::InstanceSection(reader) => Err(ParseIssue::unsupported(
@@ -567,6 +582,7 @@ fn parse_body(body: wp::FunctionBody, types: &Types) -> Result<Code, ParseError>
 fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, ParseError> {
     use crate::Instr::*;
     use wp::Operator as wp;
+    // Xref: `for_each_operator!` in wasmparser.
     Ok(match op {
         wp::Unreachable => Unreachable,
         wp::Nop => Nop,
@@ -575,18 +591,20 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         wp::Loop { blockty } => Loop(parse_block_ty(blockty, offset + 1, types)?),
         wp::If { blockty } => If(parse_block_ty(blockty, offset + 1, types)?),
         wp::Else => Else,
-        wp::End => End,
 
-        wp::Try { blockty: _ }
-        | wp::Catch { tag_index: _ }
-        | wp::CatchAll
-        | wp::Throw { tag_index: _ }
-        | wp::Rethrow { relative_depth: _ }
-        | wp::Delegate { relative_depth: _ } => Err(ParseIssue::unsupported(
+        wp::TryTable { .. }
+        | wp::Throw { .. }
+        | wp::ThrowRef { .. }
+        | wp::Try { .. }
+        | wp::Catch { .. }
+        | wp::Rethrow { .. }
+        | wp::Delegate { .. }
+        | wp::CatchAll { .. } => Err(ParseIssue::unsupported(
             offset,
             WasmExtension::ExceptionHandling,
         ))?,
 
+        wp::End => End,
         wp::Br { relative_depth } => Br(Label::from(relative_depth)),
         wp::BrIf { relative_depth } => BrIf(Label::from(relative_depth)),
         wp::BrTable { targets } => {
@@ -606,10 +624,8 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         wp::CallIndirect {
             type_index,
             table_index,
-            table_byte,
         } => {
             let table_idx = if table_index != 0 { table_index } else { 0 };
-            assert!(table_byte == 0, "not sure which extension this is");
             CallIndirect(types.get(type_index, offset + 1)?, table_idx.into())
         }
 
@@ -672,13 +688,13 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         // read from the instruction stream, and mem is it if parsed as a LEB128.
         // I think the variable-length parser is more robust, as it can handle memory indices
         // above 255, so ignore `mem_byte` here.
-        wp::MemorySize { mem, mem_byte: _ } => {
+        wp::MemorySize { mem } => {
             if mem != 0 {
                 Err(ParseIssue::unsupported(offset, WasmExtension::MultiMemory))?
             }
             MemorySize(0u32.into())
         }
-        wp::MemoryGrow { mem, mem_byte: _ } => {
+        wp::MemoryGrow { mem } => {
             if mem != 0 {
                 Err(ParseIssue::unsupported(offset, WasmExtension::MultiMemory))?
             }
@@ -709,9 +725,14 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         wp::F32Const { value } => Const(Val::F32(OrderedFloat(f32::from_bits(value.bits())))),
         wp::F64Const { value } => Const(Val::F64(OrderedFloat(f64::from_bits(value.bits())))),
 
-        wp::RefNull { ty } => RefNull(parse_elem_ty(ty, offset)?),
+        wp::RefNull { hty } => RefNull(parse_heap_ty(hty, offset)?),
         wp::RefIsNull => RefIsNull,
         wp::RefFunc { function_index } => RefFunc(function_index.into()),
+
+        wp::RefEq => Err(ParseIssue::unsupported(
+            offset,
+            WasmExtension::GarbageCollection,
+        ))?,
 
         wp::I32Eqz => Unary(UnaryOp::I32Eqz),
         wp::I64Eqz => Unary(UnaryOp::I64Eqz),
@@ -851,6 +872,48 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         wp::F64Max => Binary(BinaryOp::F64Max),
         wp::F64Copysign => Binary(BinaryOp::F64Copysign),
 
+        // Garbage collection extension
+        wp::StructNew { .. }
+        | wp::StructNewDefault { .. }
+        | wp::StructGet { .. }
+        | wp::StructGetS { .. }
+        | wp::StructGetU { .. }
+        | wp::StructSet { .. }
+        | wp::ArrayNew { .. }
+        | wp::ArrayNewDefault { .. }
+        | wp::ArrayNewFixed { .. }
+        | wp::ArrayNewData { .. }
+        | wp::ArrayNewElem { .. }
+        | wp::ArrayGet { .. }
+        | wp::ArrayGetS { .. }
+        | wp::ArrayGetU { .. }
+        | wp::ArraySet { .. }
+        | wp::ArrayLen { .. }
+        | wp::ArrayFill { .. }
+        | wp::ArrayCopy { .. }
+        | wp::ArrayInitData { .. }
+        | wp::ArrayInitElem { .. }
+        | wp::RefTestNonNull { .. }
+        | wp::RefTestNullable { .. }
+        | wp::RefCastNonNull { .. }
+        | wp::RefCastNullable { .. }
+        | wp::BrOnCast { .. }
+        | wp::BrOnCastFail { .. }
+        | wp::AnyConvertExtern { .. }
+        | wp::ExternConvertAny { .. }
+        | wp::RefI31 { .. }
+        | wp::I31GetS { .. }
+        | wp::I31GetU { .. } => Err(ParseIssue::unsupported(
+            offset,
+            WasmExtension::GarbageCollection,
+        ))?,
+
+        wp::MemoryDiscard { .. } => Err(ParseIssue::unsupported(
+            offset,
+            WasmExtension::MemoryControl,
+        ))?,
+
+        // Threads and atomics extension
         wp::MemoryAtomicNotify { memarg: _ }
         | wp::MemoryAtomicWait32 { memarg: _ }
         | wp::MemoryAtomicWait64 { memarg: _ }
@@ -922,20 +985,35 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
             WasmExtension::ThreadsAtomics,
         ))?,
 
-        wp::V128Load { memarg: _ }
-        | wp::V128Load8x8S { memarg: _ }
-        | wp::V128Load8x8U { memarg: _ }
-        | wp::V128Load16x4S { memarg: _ }
-        | wp::V128Load16x4U { memarg: _ }
-        | wp::V128Load32x2S { memarg: _ }
-        | wp::V128Load32x2U { memarg: _ }
-        | wp::V128Load8Splat { memarg: _ }
-        | wp::V128Load16Splat { memarg: _ }
-        | wp::V128Load32Splat { memarg: _ }
-        | wp::V128Load64Splat { memarg: _ }
-        | wp::V128Load32Zero { memarg: _ }
-        | wp::V128Load64Zero { memarg: _ }
-        | wp::V128Store { memarg: _ }
+        // Shared-everything threads
+        wp::GlobalAtomicGet { .. }
+        | wp::GlobalAtomicSet { .. }
+        | wp::GlobalAtomicRmwAdd { .. }
+        | wp::GlobalAtomicRmwSub { .. }
+        | wp::GlobalAtomicRmwAnd { .. }
+        | wp::GlobalAtomicRmwOr { .. }
+        | wp::GlobalAtomicRmwXor { .. }
+        | wp::GlobalAtomicRmwXchg { .. }
+        | wp::GlobalAtomicRmwCmpxchg { .. } => Err(ParseIssue::unsupported(
+            offset,
+            WasmExtension::SharedEverythingThreads,
+        ))?,
+
+        // SIMD extension
+        wp::V128Load { .. }
+        | wp::V128Load8x8S { .. }
+        | wp::V128Load8x8U { .. }
+        | wp::V128Load16x4S { .. }
+        | wp::V128Load16x4U { .. }
+        | wp::V128Load32x2S { .. }
+        | wp::V128Load32x2U { .. }
+        | wp::V128Load8Splat { .. }
+        | wp::V128Load16Splat { .. }
+        | wp::V128Load32Splat { .. }
+        | wp::V128Load64Splat { .. }
+        | wp::V128Load32Zero { .. }
+        | wp::V128Load64Zero { .. }
+        | wp::V128Store { .. }
         | wp::V128Load8Lane { memarg: _, lane: _ }
         | wp::V128Load16Lane { memarg: _, lane: _ }
         | wp::V128Load32Lane { memarg: _, lane: _ }
@@ -957,8 +1035,12 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         | wp::I64x2ExtractLane { lane: _ }
         | wp::I64x2ReplaceLane { lane: _ }
         | wp::F32x4ExtractLane { lane: _ }
-        | wp::F32x4ReplaceLane { lane: _ }
-        | wp::F64x2ExtractLane { lane: _ }
+        | wp::F32x4ReplaceLane { lane: _ } => Err(ParseIssue::unsupported(
+            offset,
+            WasmExtension::ThreadsAtomics,
+        ))?,
+
+        wp::F64x2ExtractLane { lane: _ }
         | wp::F64x2ReplaceLane { lane: _ }
         | wp::I8x16Swizzle
         | wp::I8x16Splat
@@ -1160,14 +1242,14 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         | wp::F64x2PromoteLowF32x4 => Err(ParseIssue::unsupported(offset, WasmExtension::Simd))?,
 
         wp::I8x16RelaxedSwizzle
-        | wp::I32x4RelaxedTruncSatF32x4S
-        | wp::I32x4RelaxedTruncSatF32x4U
-        | wp::I32x4RelaxedTruncSatF64x2SZero
-        | wp::I32x4RelaxedTruncSatF64x2UZero
-        | wp::F32x4RelaxedFma
-        | wp::F32x4RelaxedFnma
-        | wp::F64x2RelaxedFma
-        | wp::F64x2RelaxedFnma
+        | wp::I32x4RelaxedTruncF32x4S
+        | wp::I32x4RelaxedTruncF32x4U
+        | wp::I32x4RelaxedTruncF64x2SZero
+        | wp::I32x4RelaxedTruncF64x2UZero
+        | wp::F32x4RelaxedMadd
+        | wp::F32x4RelaxedNmadd
+        | wp::F64x2RelaxedMadd
+        | wp::F64x2RelaxedNmadd
         | wp::I8x16RelaxedLaneselect
         | wp::I16x8RelaxedLaneselect
         | wp::I32x4RelaxedLaneselect
@@ -1177,11 +1259,19 @@ fn parse_instr(op: wp::Operator, offset: usize, types: &Types) -> Result<Instr, 
         | wp::F64x2RelaxedMin
         | wp::F64x2RelaxedMax
         | wp::I16x8RelaxedQ15mulrS
-        | wp::I16x8DotI8x16I7x16S
-        | wp::I32x4DotI8x16I7x16AddS
-        | wp::F32x4RelaxedDotBf16x8AddF32x4 => {
+        | wp::I16x8RelaxedDotI8x16I7x16S
+        | wp::I32x4RelaxedDotI8x16I7x16AddS => {
             Err(ParseIssue::unsupported(offset, WasmExtension::RelaxedSimd))?
         }
+
+        wp::CallRef { .. }
+        | wp::ReturnCallRef { .. }
+        | wp::RefAsNonNull { .. }
+        | wp::BrOnNull { .. }
+        | wp::BrOnNonNull { .. } => Err(ParseIssue::unsupported(
+            offset,
+            WasmExtension::TypedFunctionReferences,
+        ))?,
     })
 }
 
@@ -1225,7 +1315,7 @@ fn parse_memory_ty(ty: wp::MemoryType, offset: usize) -> Result<Limits, ParseErr
 }
 
 fn parse_table_ty(ty: wp::TableType, offset: usize) -> Result<(Limits, RefType), ParseError> {
-    let refty = parse_elem_ty(ty.element_type, offset)?;
+    let refty = parse_ref_ty(ty.element_type, offset)?;
     Ok((
         Limits {
             initial_size: ty.initial,
@@ -1235,21 +1325,20 @@ fn parse_table_ty(ty: wp::TableType, offset: usize) -> Result<(Limits, RefType),
     ))
 }
 
-fn parse_elem_ty(ty: wp::ValType, offset: usize) -> Result<RefType, ParseError> {
-    use wp::ValType::*;
+fn parse_ref_ty(ty: wp::RefType, offset: usize) -> Result<RefType, ParseError> {
     match ty {
-        I32 | I64 | F32 | F64 => Err(ParseIssue::message(
-            offset,
-            "only reftypes, not value types are allowed as table elements",
-            None,
-        ))?,
-        V128 => Err(ParseIssue::message(
-            offset,
-            "only reftypes, not value types are allowed as table elements",
-            None,
-        ))?,
-        FuncRef => Ok(RefType::FuncRef),
-        ExternRef => Ok(RefType::ExternRef),
+        wp::RefType::FUNCREF => Ok(RefType::FuncRef),
+        wp::RefType::EXTERNREF => Ok(RefType::ExternRef),
+        _ => Err(ParseIssue::message(offset, "unexpected wp::RefType", None))?,
+    }
+}
+
+// NB: This probably shouldn't return a RefType.
+fn parse_heap_ty(ty: wp::HeapType, offset: usize) -> Result<RefType, ParseError> {
+    match ty {
+        wp::HeapType::Func => Ok(RefType::FuncRef),
+        wp::HeapType::Extern => Ok(RefType::ExternRef),
+        _ => Err(ParseIssue::message(offset, "unexpected wp::HeapType", None))?,
     }
 }
 
@@ -1301,8 +1390,7 @@ fn parse_val_ty(ty: wp::ValType, offset: usize) -> Result<ValType, ParseError> {
         wp::ValType::F32 => Ok(ValType::F32),
         wp::ValType::F64 => Ok(ValType::F64),
         wp::ValType::V128 => Err(ParseIssue::unsupported(offset, WasmExtension::Simd))?,
-        wp::ValType::FuncRef => Ok(ValType::Ref(RefType::FuncRef)),
-        wp::ValType::ExternRef => Ok(ValType::Ref(RefType::ExternRef)),
+        wp::ValType::Ref(ref_ty) => parse_ref_ty(ref_ty, offset).map(ValType::Ref),
     }
 }
 
@@ -1314,7 +1402,8 @@ fn parse_name_custom_section(
     warnings: &mut Vec<ParseIssue>,
     module: &mut Module,
 ) -> Result<(), ParseIssue> {
-    for name_subsection in wp::NameSectionReader::new(data, data_offset) {
+    let reader = wp::BinaryReader::new(data, data_offset, wp::WasmFeatures::all());
+    for name_subsection in wp::NameSectionReader::new(reader) {
         use wp::Name;
         match name_subsection? {
             Name::Module { name, name_range } => {
@@ -1387,8 +1476,13 @@ fn parse_name_custom_section(
             | Name::Memory(name_map)
             | Name::Global(name_map)
             | Name::Element(name_map)
-            | Name::Data(name_map) => warnings.push(ParseIssue::unsupported(
+            | Name::Data(name_map)
+            | Name::Tag(name_map) => warnings.push(ParseIssue::unsupported(
                 name_map.range().start,
+                WasmExtension::ExtendedNameSection,
+            )),
+            Name::Field(indirect_name_map) => warnings.push(ParseIssue::unsupported(
+                indirect_name_map.range().start,
                 WasmExtension::ExtendedNameSection,
             )),
             Name::Unknown {

@@ -6,8 +6,8 @@ edition = "2021"
 
 [dependencies]
 # For low-level WebAssembly parsing/encoding.
-wasmparser = "0.96.0"
-wasm-encoder = "0.20.0"
+wasmparser = "0.210"
+wasm-encoder = "0.210"
 
 ordered-float = "3.4.0"
 

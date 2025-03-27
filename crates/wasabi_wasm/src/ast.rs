@@ -173,8 +173,8 @@ impl FromStr for ValType {
 /// Limits for tables and memories.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct Limits {
-    pub initial_size: u32,
-    pub max_size: Option<u32>,
+    pub initial_size: u64,
+    pub max_size: Option<u64>,
 }
 
 /// Type of global (scalar) variables.
@@ -510,7 +510,10 @@ pub struct Element {
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum ElementMode {
     Passive,
-    Active { table: Idx<Table>, offset: Expr },
+    Active {
+        table: Option<Idx<Table>>,
+        offset: Expr,
+    },
     Declarative,
 }
 
